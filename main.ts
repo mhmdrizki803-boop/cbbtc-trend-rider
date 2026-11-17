@@ -1,66 +1,67 @@
 import { runBars, type OrderInput } from './vendor/makefun-bars.ts';
 
-const TRAIL_BPS = 250n;
-const REENTRY_BPS = 50n;
-const MEAN_BARS = 60;
-const WARMUP_BARS = 3;
+const MEAN_BARS = 480;
+const DIP_PCT = 0.008;
+const TAKE_PCT = 0.001;
 const MAX_SLIPPAGE_BPS = 60;
 const BPS = 10_000n;
+const DIP_BPS = BigInt(DIP_PCT * Number(BPS));
+const TAKE_BPS = BigInt(TAKE_PCT * Number(BPS));
 
-const closes: bigint[] = [];
-let peak: bigint | null = null;
-let exitLevel: bigint | null = null;
-let pending: 'buy' | 'sell' | null = null;
+const closes = new Map<string, bigint[]>();
+const pending = new Set<string>();
 
 await runBars({
   onBatch(state, batch) {
-    const symbol = state.hello.symbols[0]?.symbol;
-    if (symbol === undefined) return [];
+    for (const fill of batch.fills) pending.delete(fill.symbol);
 
-    for (const fill of batch.fills) {
-      if (fill.symbol === symbol && fill.status === 'filled') {
-        pending = null;
-        if (fill.side === 'buy') peak = BigInt(fill.price);
-      } else if (fill.symbol === symbol && fill.status === 'rejected') {
-        pending = null;
+    for (const bar of batch.bars) {
+      const history = closes.get(bar.symbol) ?? [];
+      history.push(BigInt(bar.c));
+      if (history.length > MEAN_BARS) history.shift();
+      closes.set(bar.symbol, history);
+    }
+
+    if (state.warmingUp) return [];
+
+    for (const bar of batch.bars) {
+      const symbol = bar.symbol;
+      const history = closes.get(symbol)!;
+      if (history.length < MEAN_BARS || pending.has(symbol)) continue;
+
+      const close = BigInt(bar.c);
+      const meanSum = history.reduce((sum, value) => sum + value, 0n);
+      const position = state.positions.get(symbol);
+
+      if (position !== undefined) {
+        if (close * BigInt(MEAN_BARS) * BPS > meanSum * (BPS + TAKE_BPS)) {
+          pending.add(symbol);
+          return [{
+            side: 'sell',
+            symbol,
+            qty: position.qty,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          }];
+        }
+        continue;
+      }
+
+      if (close * BigInt(MEAN_BARS) * BPS < meanSum * (BPS - DIP_BPS)) {
+        const weightRoom = state.weightRoom(symbol);
+        const amount = state.cash < weightRoom ? state.cash : weightRoom;
+        if (amount < BigInt(state.hello.fees.min_notional_quote_units)) continue;
+
+        pending.add(symbol);
+        const order: OrderInput = {
+          side: 'buy',
+          symbol,
+          notional_quote_units: amount,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        };
+        return [order];
       }
     }
 
-    const bar = batch.bars.find((candidate) => candidate.symbol === symbol);
-    if (bar === undefined) return [];
-    const close = BigInt(bar.c);
-    closes.push(close);
-    if (closes.length > MEAN_BARS) closes.shift();
-
-    if (state.warmingUp || pending !== null) return [];
-
-    const held = state.positions.get(symbol);
-    if (held !== undefined) {
-      if (peak === null || close > peak) peak = close;
-      if (close * BPS < peak * (BPS - TRAIL_BPS)) {
-        exitLevel = close;
-        pending = 'sell';
-        return [{ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-      }
-      return [];
-    }
-
-    peak = null;
-    if (state.seq + 1 < WARMUP_BARS) return [];
-    const meanSum = closes.reduce((sum, price) => sum + price, 0n);
-    const aboveMean = close * BigInt(MEAN_BARS) > meanSum;
-    const recovered = exitLevel !== null && close * BPS > exitLevel * (BPS + REENTRY_BPS);
-    if (exitLevel !== null && !recovered && !aboveMean) return [];
-
-    const amount = state.cash < state.weightRoom(symbol) ? state.cash : state.weightRoom(symbol);
-    if (amount < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-    pending = 'buy';
-    const order: OrderInput = {
-      side: 'buy',
-      symbol,
-      notional_quote_units: amount,
-      max_slippage_bps: MAX_SLIPPAGE_BPS,
-    };
-    return [order];
+    return [];
   },
 });
